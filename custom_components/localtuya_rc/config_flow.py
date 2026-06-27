@@ -116,9 +116,9 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Ask user to enter the IP manually."""
         if user_input is not None:
             self.config[CONF_HOST] = user_input[CONF_HOST]
-            id = user_input[CONF_DEVICE_ID].split(' ')[-1][1:-1]
-            self.config[CONF_DEVICE_ID] = id
-            devices = [device for device in self.cloud_devices if device['id'] == id]
+            device_id = user_input[CONF_DEVICE_ID].split(' ')[-1][1:-1]
+            self.config[CONF_DEVICE_ID] = device_id
+            devices = [device for device in self.cloud_devices if device['id'] == device_id]
             self.config[CONF_NAME] = devices[0]['name']
             self.config[CONF_LOCAL_KEY] = devices[0]['key']
             return await self.async_step_config()
@@ -152,7 +152,7 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             spl = user_input[CONF_HOST].split(' ', maxsplit=1)
             ip = spl[0]
             self.config[CONF_HOST] = ip
-            self.config[CONF_DEVICE_ID] = self.scan_devices[ip]["gwId"]
+            self.config[CONF_DEVICE_ID] = self.scan_devices[ip]['gwId']
             if self.cloud:
                 for device in self.cloud_devices:
                     if device['id'] == self.config[CONF_DEVICE_ID]:
@@ -169,12 +169,12 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if len(self.scan_devices) == 0:
                 return await self.async_step_pre_scan(errors={"base": "tuya_not_found"})
             if not self.cloud:
-                ip_list = [f"{ip} ({self.scan_devices[ip]["gwId"]})" for ip in self.scan_devices]
+                ip_list = [f"{ip} ({self.scan_devices[ip]['gwId']})" for ip in self.scan_devices]
             else:
                 ip_list = []
                 for ip in self.scan_devices:
                     for device in self.cloud_devices:
-                        if device['id'] == self.scan_devices[ip]["gwId"]:
+                        if device['id'] == self.scan_devices[ip]['gwId']:
                             ip_list.append(f"{ip} - {device['name']}")
                             break
                 if len(ip_list) == 0:
@@ -193,7 +193,9 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     def _test_connection(self, dev_id, address, local_key, version, control_type=0):
-        _LOGGER.debug("Testing connection to %s at %s with key %s, control_type=%s", dev_id, address, local_key, control_type)
+        _LOGGER.debug("Testing connection to %s at %s with key %s, control_type=%s, version=%s", dev_id, address, local_key, control_type, version)
+        version = float(version) if version is not None else None
+        _LOGGER.debug("Constructing IRRemoteControlDevice version=%r control_type=%s", version, control_type or 0)
         device = Contrib.IRRemoteControlDevice(
             dev_id=dev_id,
             address=address,
@@ -206,7 +208,65 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         status = device.status()
         _LOGGER.debug("Connection test status: %s, control type detected: %s", status, device.control_type)
+        if self._is_test_status_successful(status, version, device):
+            status = None
         return device, status
+
+    def _is_test_status_successful(self, status, version, device):
+        """Return True when a test connection status should be treated as success."""
+        if not isinstance(status, dict):
+            return False
+
+        if "Error" not in status:
+            return True
+
+        err = str(status.get("Err", "")).strip()
+        if err != "900":
+            return False
+
+        if version is None:
+            return False
+
+        if version < 3.5:
+            return False
+
+        if not device or device.control_type not in (1, 2):
+            return False
+
+        _LOGGER.debug(
+            "Accepting protocol %s control_type=%s despite ERR 900 response; "
+            "device handshake succeeded and control_type is set.",
+            version,
+            device.control_type,
+        )
+        return True
+
+    @staticmethod
+    def _control_type_candidates(control_type_input, protocol_version):
+        """Return preferred control-type candidates for probing.
+
+        Newer Smart IR devices commonly use control_type=2 (DPS 1-13), while
+        older devices use control_type=1 (DPS 201/202). For v3.4/v3.5 we try 2
+        first to avoid the flaky autodetect path in tinytuya.
+        """
+        if control_type_input != "Auto":
+            result = [int(control_type_input)]
+        else:
+            try:
+                version = float(str(protocol_version))
+            except (TypeError, ValueError):
+                version = None
+            if version is not None and version >= 3.4:
+                result = [2, 1, 0]
+            else:
+                result = [1, 2, 0]
+        _LOGGER.debug(
+            "Control-type candidates for protocol_version=%s input=%s -> %s",
+            protocol_version,
+            control_type_input,
+            result,
+        )
+        return result
 
     @staticmethod
     def _classify_test_failure(status, exception):
@@ -247,15 +307,15 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self.config[CONF_DEVICE_ID] = user_input[CONF_DEVICE_ID]
             self.config[CONF_LOCAL_KEY] = user_input[CONF_LOCAL_KEY]
             self.config[CONF_PERSISTENT_CONNECTION] = user_input[CONF_PERSISTENT_CONNECTION]
-            self.config[CONF_PROTOCOL_VERSION] = user_input[CONF_PROTOCOL_VERSION]
+            self.config[CONF_PROTOCOL_VERSION] = str(user_input[CONF_PROTOCOL_VERSION])
             self.config[CONF_CONTROL_TYPE] = user_input[CONF_CONTROL_TYPE]
             # If user explicitly chose a control_type, pass it to the device
             # constructor so tinytuya skips its own (sometimes flaky) detection
             # and uses the supplied value as authoritative.
             ct_input = user_input[CONF_CONTROL_TYPE]
-            ct_param = 0 if ct_input == "Auto" else int(ct_input)
+            ct_candidates = self._control_type_candidates(ct_input, user_input[CONF_PROTOCOL_VERSION])
             # Bruteforce the protocol version (in order of preference)
-            try_versions = TUYA_VERSIONS if user_input[CONF_PROTOCOL_VERSION] == "Auto" else [user_input[CONF_PROTOCOL_VERSION]]
+            try_versions = TUYA_VERSIONS if user_input[CONF_PROTOCOL_VERSION] == "Auto" else [str(user_input[CONF_PROTOCOL_VERSION])]
             version_ok = None
             device = None
             # Track the most informative failure across all attempts so that
@@ -266,28 +326,39 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             for version in try_versions:
                 _LOGGER.debug("Trying protocol version %s", version)
                 status = None
-                try:
-                    device, status = await self.hass.async_add_executor_job(
-                        self._test_connection,
-                        user_input[CONF_DEVICE_ID],
-                        user_input[CONF_HOST],
-                        user_input[CONF_LOCAL_KEY],
+                for ct_param in ct_candidates:
+                    _LOGGER.debug("Trying control type %s for protocol version %s", ct_param, version)
+                    try:
+                        device, status = await self.hass.async_add_executor_job(
+                            self._test_connection,
+                            user_input[CONF_DEVICE_ID],
+                            user_input[CONF_HOST],
+                            user_input[CONF_LOCAL_KEY],
+                            version,
+                            ct_param,
+                        )
+                    except Exception as e:
+                        _LOGGER.error("Device test exception for protocol=%s control_type=%s: %s", version, ct_param, e, exc_info=True)
+                        last_exception = e
+                        last_status = None
+                        last_failure = self._classify_test_failure(None, e) or last_failure
+                        continue
+                    last_status = status
+                    last_exception = None
+                    classified = self._classify_test_failure(status, None)
+                    _LOGGER.debug(
+                        "Device probe result for protocol=%s control_type=%s status=%s classified=%s",
                         version,
                         ct_param,
+                        status,
+                        classified,
                     )
-                except Exception as e:
-                    _LOGGER.error("Device test error, exception %s: %s", type(e), e, exc_info=True)
-                    last_exception = e
-                    last_status = None
-                    last_failure = self._classify_test_failure(None, e) or last_failure
-                    continue
-                last_status = status
-                last_exception = None
-                classified = self._classify_test_failure(status, None)
-                if classified is None:
-                    version_ok = version
+                    if classified is None:
+                        version_ok = version
+                        break
+                    last_failure = classified
+                if version_ok:
                     break
-                last_failure = classified
             if not version_ok:
                 errors["base"] = last_failure
                 _LOGGER.error(
@@ -302,7 +373,7 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_abort(reason="already_configured")
             else:
                 # Ok!
-                self.config[CONF_PROTOCOL_VERSION] = version_ok
+                self.config[CONF_PROTOCOL_VERSION] = str(version_ok)
                 self.config[CONF_CONTROL_TYPE] = device.control_type
                 if self.cloud and 'key' in self.cloud_info:
                     del self.cloud_info['key'] # to protect the key
@@ -375,22 +446,26 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
 
         # Test connection at the new IP
-        try:
-            device, status = await self.hass.async_add_executor_job(
-                self._test_connection, dev_id, new_ip, local_key, float(protocol_version))
-        except Exception as e:
-            _LOGGER.error("Connection test error at %s: %s", new_ip, e, exc_info=True)
-            return self.async_show_form(
-                step_id="reconfigure_scan",
-                errors={"base": self._classify_test_failure(None, e) or "cannot_connect"},
-                data_schema=vol.Schema({})
-            )
+        control_types = self._control_type_candidates(config.get(CONF_CONTROL_TYPE, 0), protocol_version)
+        device = None
+        status = None
+        last_classified = None
+        for ct in control_types:
+            try:
+                device, status = await self.hass.async_add_executor_job(
+                    self._test_connection, dev_id, new_ip, local_key, float(protocol_version), ct)
+            except Exception as e:
+                _LOGGER.error("Connection test error at %s with control_type=%s: %s", new_ip, ct, e, exc_info=True)
+                last_classified = self._classify_test_failure(None, e) or last_classified
+                continue
+            last_classified = self._classify_test_failure(status, None)
+            if last_classified is None:
+                break
 
-        classified = self._classify_test_failure(status, None)
-        if classified is not None:
+        if device is None or last_classified is not None:
             return self.async_show_form(
                 step_id="reconfigure_scan",
-                errors={"base": classified},
+                errors={"base": last_classified or "cannot_connect"},
                 data_schema=vol.Schema({})
             )
 
@@ -416,17 +491,22 @@ class LocalTuyaIRConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Test connection at the new IP
             status = None
             device = None
-            try:
-                device, status = await self.hass.async_add_executor_job(
-                    self._test_connection, dev_id, new_ip, local_key, float(protocol_version))
-            except Exception as e:
-                _LOGGER.error("Connection test error at %s: %s", new_ip, e, exc_info=True)
-                errors["base"] = self._classify_test_failure(None, e) or "cannot_connect"
+            last_classified = None
+            control_types = self._control_type_candidates(config.get(CONF_CONTROL_TYPE, 0), protocol_version)
+            for ct in control_types:
+                try:
+                    device, status = await self.hass.async_add_executor_job(
+                        self._test_connection, dev_id, new_ip, local_key, float(protocol_version), ct)
+                    last_classified = self._classify_test_failure(status, None)
+                    if last_classified is None:
+                        break
+                except Exception as e:
+                    _LOGGER.error("Connection test error at %s with control_type=%s: %s", new_ip, ct, e, exc_info=True)
+                    last_classified = self._classify_test_failure(None, e) or last_classified
+                    continue
 
-            if "base" not in errors:
-                classified = self._classify_test_failure(status, None)
-                if classified is not None:
-                    errors["base"] = classified
+            if last_classified is not None:
+                errors["base"] = last_classified
 
             if not errors:
                 config[CONF_HOST] = new_ip

@@ -53,14 +53,16 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
             vol.Required(CONF_HOST): cv.string,
             vol.Required(CONF_DEVICE_ID): cv.string,
             vol.Required(CONF_LOCAL_KEY): cv.string,
-            vol.Required(CONF_PROTOCOL_VERSION, default="3.3"): vol.In(
-                ["3.1", "3.2", "3.3", "3.4", "3.5"]
+            vol.Required(CONF_PROTOCOL_VERSION, default="3.3"): vol.All(
+                vol.Coerce(str),
+                vol.In(["3.1", "3.2", "3.3", "3.4", "3.5"]),
             ),
             vol.Required(CONF_PERSISTENT_CONNECTION, default=DEFAULT_PERSISTENT_CONNECTION): cv.boolean,
     }
 )
 
 _LOGGER = logging.getLogger(__name__)
+_LOGGER.debug("Loading custom_components.localtuya_rc.remote module")
 
 
 async def async_setup_entry(hass, entry, async_add_entities, discovery_info=None):
@@ -79,6 +81,8 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     host = config.get(CONF_HOST)
     local_key = config.get(CONF_LOCAL_KEY)
     protocol_version = config.get(CONF_PROTOCOL_VERSION)
+    if protocol_version is not None:
+        protocol_version = str(protocol_version)
     cloud_info = config.get(CONF_CLOUD_INFO, None)
     persistent_connection = config.get(CONF_PERSISTENT_CONNECTION, DEFAULT_PERSISTENT_CONNECTION)
     control_type = config.get(CONF_CONTROL_TYPE, 0)
@@ -124,6 +128,28 @@ class TuyaRC(RemoteEntity):
         self._device_RF = None
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _control_type_candidates(control_type_input, protocol_version):
+        """Return preferred control-type candidates for runtime initialization."""
+        if control_type_input not in (None, "", 0, "Auto"):
+            result = [int(control_type_input)]
+        else:
+            try:
+                version = float(str(protocol_version))
+            except (TypeError, ValueError):
+                version = None
+            if version is not None and version >= 3.4:
+                result = [2, 1, 0]
+            else:
+                result = [1, 2, 0]
+        _LOGGER.debug(
+            "Runtime control-type candidates for protocol_version=%s input=%s -> %s",
+            protocol_version,
+            control_type_input,
+            result,
+        )
+        return result
+
     def _init(self):
         if self._device:
             return
@@ -131,17 +157,38 @@ class TuyaRC(RemoteEntity):
         # Passing a non-zero control_type tells tinytuya to skip the network-heavy
         # detect_control_type() call that would otherwise run inside __init__ and
         # block for many seconds on an offline device.
-        self._device = Contrib.IRRemoteControlDevice(
-            dev_id=self._dev_id,
-            address=self._address,
-            local_key=self._local_key,
-            version=float(self._protocol_version),
-            persist=self._persistent_connection,
-            control_type=self._control_type or 0,
-            connection_timeout=self._CONNECTION_TIMEOUT,
-            connection_retry_delay=self._CONNECTION_RETRY_DELAY,
-            connection_retry_limit=self._CONNECTION_RETRY_LIMIT,
-        )
+        version = float(self._protocol_version) if self._protocol_version is not None else None
+        candidates = self._control_type_candidates(self._control_type, self._protocol_version)
+        _LOGGER.debug("Runtime init will try control_type candidates %s", candidates)
+        last_error = None
+        for control_type in candidates:
+            _LOGGER.debug("Runtime init trying control_type=%s", control_type)
+            try:
+                self._device = Contrib.IRRemoteControlDevice(
+                    dev_id=self._dev_id,
+                    address=self._address,
+                    local_key=self._local_key,
+                    version=version,
+                    persist=self._persistent_connection,
+                    control_type=control_type or 0,
+                    connection_timeout=self._CONNECTION_TIMEOUT,
+                    connection_retry_delay=self._CONNECTION_RETRY_DELAY,
+                    connection_retry_limit=self._CONNECTION_RETRY_LIMIT,
+                )
+                if self._device.control_type:
+                    self._control_type = self._device.control_type
+                    break
+            except Exception as err:
+                _LOGGER.debug("Runtime init failed for control_type=%s: %s", control_type, err, exc_info=True)
+                last_error = err
+                self._device = None
+            else:
+                if self._device.control_type:
+                    break
+        if self._device is None:
+            if last_error is not None:
+                raise last_error
+            raise HomeAssistantError("Unable to initialize IR device.")
         _LOGGER.debug("Device %s initialized.", self._dev_id)
 
     def _init_rf(self):
@@ -150,17 +197,38 @@ class TuyaRC(RemoteEntity):
         if self._device_RF:
             return
         _LOGGER.debug("Initializing RF device %s...", self._dev_id)
-        self._device_RF = RFRemoteControlDevice.RFRemoteControlDevice(
-            dev_id=self._dev_id,
-            address=self._address,
-            local_key=self._local_key,
-            version=float(self._protocol_version),
-            persist=self._persistent_connection,
-            control_type=self._control_type or 0,
-            connection_timeout=self._CONNECTION_TIMEOUT,
-            connection_retry_delay=self._CONNECTION_RETRY_DELAY,
-            connection_retry_limit=self._CONNECTION_RETRY_LIMIT,
-        )
+        version = float(self._protocol_version) if self._protocol_version is not None else None
+        candidates = self._control_type_candidates(self._control_type, self._protocol_version)
+        _LOGGER.debug("RF init will try control_type candidates %s", candidates)
+        last_error = None
+        for control_type in candidates:
+            _LOGGER.debug("RF init trying control_type=%s", control_type)
+            try:
+                self._device_RF = RFRemoteControlDevice.RFRemoteControlDevice(
+                    dev_id=self._dev_id,
+                    address=self._address,
+                    local_key=self._local_key,
+                    version=version,
+                    persist=self._persistent_connection,
+                    control_type=control_type or 0,
+                    connection_timeout=self._CONNECTION_TIMEOUT,
+                    connection_retry_delay=self._CONNECTION_RETRY_DELAY,
+                    connection_retry_limit=self._CONNECTION_RETRY_LIMIT,
+                )
+                if self._device_RF.control_type:
+                    self._control_type = self._device_RF.control_type
+                    break
+            except Exception as err:
+                _LOGGER.debug("RF init failed for control_type=%s: %s", control_type, err, exc_info=True)
+                last_error = err
+                self._device_RF = None
+            else:
+                if self._device_RF.control_type:
+                    break
+        if self._device_RF is None:
+            if last_error is not None:
+                raise last_error
+            raise HomeAssistantError("Unable to initialize RF device.")
         _LOGGER.debug("RF device %s initialized.", self._dev_id)
 
     def _deinit(self):
@@ -202,6 +270,29 @@ class TuyaRC(RemoteEntity):
 
         hass.loop.call_soon_threadsafe(_do_update)
         _LOGGER.debug("Persisted control_type=%s for %s", control_type, self._dev_id)
+
+    def _is_status_successful(self, status):
+        """Return True when a tinytuya status is a valid successful response."""
+        if not isinstance(status, dict):
+            return False
+
+        if "Error" not in status:
+            return True
+
+        err = str(status.get("Err", "")).strip()
+        if err == "900":
+            try:
+                version = float(str(self._protocol_version))
+            except (TypeError, ValueError):
+                version = None
+            if version is not None and version >= 3.5 and self._device and self._device.control_type in (1, 2):
+                _LOGGER.debug(
+                    "Treating protocol %s device status Err=900 as successful because control_type=%s was accepted.",
+                    self._protocol_version,
+                    self._device.control_type,
+                )
+                return True
+        return False
 
     @property
     def available(self):
@@ -350,8 +441,8 @@ class TuyaRC(RemoteEntity):
             try:
                 self._init()
                 status = self._device.status()
-                _LOGGER.debug(f"Device status: {status}")
-                self._available = bool(status) and "Error" not in status
+                _LOGGER.debug("Device status: %s", status)
+                self._available = self._is_status_successful(status)
                 if not self._available:
                     _LOGGER.error("Device is not available, status: %s", status)
             except Exception as e:
@@ -551,3 +642,11 @@ class TuyaRC(RemoteEntity):
             del self._codes[device]
 
         await self._storage.async_save(self._codes)
+
+
+# Import-time diagnostic: confirm module load and presence of expected symbol
+try:
+    _LOGGER.debug("remote module loaded; async_setup_entry present=%s", 'async_setup_entry' in globals())
+except Exception:
+    # Best-effort: avoid raising during import
+    pass

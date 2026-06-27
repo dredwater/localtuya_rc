@@ -21,4 +21,4 @@ CODE_STORAGE_VERSION = 1
 CODE_STORAGE_CODES = f"{DOMAIN}_codes"
 
 # Tuya protocol versions in order of preference
-TUYA_VERSIONS = [3.3, 3.4, 3.5, 3.2, 3.1]
+TUYA_VERSIONS = ["3.5", "3.4", "3.3", "3.2", "3.1"]
